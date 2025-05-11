@@ -1,0 +1,9 @@
+{
+    "name": "githublookup",
+    "author": ["Milon", "gus"],
+    "description": "Look up GitHub files and PRs directly in Discord",
+    "short": "GitHub integration for Discord",
+    "tags": ["github", "development", "utility"],
+    "requirements": ["PyGithub"],
+    "end_user_data_statement": "This cog stores GitHub tokens and repository information per server for accessing GitHub content. No user data is stored."
+}
