@@ -11,6 +11,8 @@ from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box
 from discord.ui import Modal, TextInput
 
+
+
 class GitHubSetupModal(Modal, title='GitHub Integration Setup'):
     token = TextInput(
         label='GitHub Token',
