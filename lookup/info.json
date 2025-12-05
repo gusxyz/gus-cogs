@@ -1,6 +1,6 @@
 {
     "name": "githublookup",
-    "author": ["Milon", "gus"],
+    "author": ["gus", "claude"],
     "description": "Look up GitHub files and PRs directly in Discord",
     "short": "GitHub integration for Discord",
     "tags": ["github", "development", "utility"],

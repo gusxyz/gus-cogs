@@ -1,559 +1,749 @@
-import discord
 import re
+import json
+import random
+import logging
+import aiohttp
+import hashlib
 import asyncio
-from typing import List, Tuple, Optional
-from github import Github, Auth
-from github.GithubException import GithubException
-from github.ContentFile import ContentFile
-from datetime import datetime
-from redbot.core import commands, Config, checks
+from typing import Optional, Dict, List, Any, Set, Tuple, Union
+from collections import defaultdict
+from urllib.parse import quote, quote_plus
+
+import discord
+from discord.ext import commands
+from redbot.core import Config, commands as red_commands, checks
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box
-from discord.ui import Modal, TextInput
+from redbot.core.utils.chat_formatting import box, pagify
+
+log = logging.getLogger("red.github")
+
+# Regex patterns
+REG_PATH = re.compile(r"\[(?:(\S+)\/\/)?(.+?)(?:(?::|#L)(\d+)(?:-L?(\d+))?)?\]", re.I)
+REG_ISSUE = re.compile(r"\[(?:(\S+)#|#)?([0-9]+)\]")
+REG_COMMIT = re.compile(r"\[(?:(\S+)@)?([0-9a-f]{40})\]", re.I)
+REG_AUTOLABEL = re.compile(r"\[(\w+?)\]", re.I)
+REG_GIT_HEADER_PAGENUM = re.compile(r"[?&]page=(\d+)[^,]+rel=\"last\"")
+MD_COMMENT_RE = re.compile(r"<!--.*-->", flags=re.DOTALL)
+
+# Constants
+COLOR_GITHUB_RED = discord.Color(0xFF4444)
+COLOR_GITHUB_GREEN = discord.Color(0x6CC644)
+COLOR_GITHUB_PURPLE = discord.Color(0x6E5494)
+MAX_BODY_LENGTH = 500
+MAX_COMMIT_LENGTH = 67
+GITHUB_ISSUE_MAX_MESSAGES = 5
 
 
-
-class GitHubSetupModal(Modal, title='GitHub Integration Setup'):
-    token = TextInput(
-        label='GitHub Token',
-        placeholder='Your GitHub personal access token',
-        required=True
-    )
-    repository = TextInput(
-        label='Repository',
-        placeholder='username/repository',
-        required=True
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.send_message("Processing...", ephemeral=True)
-        self.stop()
-
-
-class SetupButton(discord.ui.View):
-    def __init__(self, member):
-        self.member = member
-        super().__init__()
-        self.modal = None
-
-    @discord.ui.button(label='Setup', style=discord.ButtonStyle.green)
-    async def setup(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.member != interaction.user:
-            return await interaction.response.send_message("You cannot use this.", ephemeral=True)
-
-        self.modal = GitHubSetupModal()
-        await interaction.response.send_modal(self.modal)
-        await self.modal.wait()
-        self.stop()
-
-
-class GitHubLookup(commands.Cog):
-    """Look up GitHub files and PRs directly in Discord"""
+class GitHub(red_commands.Cog):
+    """GitHub integration for Red-Discord bot"""
 
     def __init__(self, bot: Red):
-        super().__init__()
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567890)
-        default_guild = {
-            "servers": {},
-            "enabled_channels": []
+        self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
+        
+        default_global = {
+            "token": None,
         }
+        
+        default_guild = {
+            "repos": [],  # List of repo configs
+        }
+        
+        self.config.register_global(**default_global)
         self.config.register_guild(**default_guild)
-        self.gh_instances = {}
-        self.search_lock = asyncio.Lock()
+        
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.cache: Dict[Tuple[str, str, Optional[str]], Tuple[Any, str]] = {}
 
-    async def cog_load(self) -> None:
-        """Initialize GitHub instances for all configured guilds on load"""
-        for guild in self.bot.guilds:
-            servers = await self.config.guild(guild).servers()
-            for server_name, server_data in servers.items():
-                try:
-                    auth = Auth.Token(server_data['token'])
-                    gh = Github(auth=auth)
-                    repo_instance = gh.get_repo(server_data['repository'])
-                    self.gh_instances[guild.id] = {
-                        "client": gh,
-                        "repo": repo_instance
-                    }
-                except Exception:
-                    continue
+    async def cog_load(self):
+        """Initialize the cog"""
+        token = await self.config.token()
+        self._init_session(token)
 
-    async def cog_unload(self) -> None:
-        """Clean up GitHub instances on unload"""
-        for instance in self.gh_instances.values():
-            instance["client"].close()
-        self.gh_instances.clear()
+    async def cog_unload(self):
+        """Cleanup when cog is unloaded"""
+        if self.session:
+            await self.session.close()
 
-    @staticmethod
-    def strip_html_comments(text: str) -> str:
-        """Remove HTML comments from text."""
-        if not text:
-            return ""
-        return re.sub(r'<!--[\s\S]*?-->', '', text)
+    def _init_session(self, token: Optional[str]):
+        """Initialize or reset the session with a token"""
+        if self.session:
+            pass
 
-    @staticmethod
-    def get_pr_status(pr) -> Tuple[str, discord.Color]:
-        """Get the status and color for a PR"""
-        if pr.merged:
-            return "Merged", discord.Color.purple()
-        elif pr.state == "open":
-            return "Open", discord.Color.green()
-        else:
-            return "Closed", discord.Color.red()
+        headers = {
+            "User-Agent": "Red-DiscordBot GitHub Cog",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        
+        if token:
+            headers["Authorization"] = f"token {token}"
+            
+        self.session = aiohttp.ClientSession(headers=headers)
 
-    @staticmethod
-    def get_issue_status_color(issue) -> discord.Color:
-        """Get the color for an issue based on its state and labels"""
-        if issue.state == "closed":
-            return discord.Color.red()
-        for label in issue.labels:
-            if label.name.lower() in ["bug", "critical", "urgent"]:
-                return discord.Color.orange()
-        return discord.Color.green()
+    def github_url(self, sub: str) -> str:
+        """Construct GitHub API URL"""
+        return f"https://api.github.com{sub}"
 
-    @staticmethod
-    def extract_line_numbers(filename: str) -> Tuple[str, Optional[int], Optional[int]]:
-        """Extract line numbers from filename if present."""
-        match = re.match(r'(.*?):(\d+)(?:-(\d+))?$', filename)
-        if match:
-            file_path = match.group(1)
-            start_line = int(match.group(2))
-            end_line = int(match.group(3)) if match.group(3) else start_line
-            return file_path, start_line, end_line
-        return filename, None, None
-
-    @staticmethod
-    def get_line_range_url(url: str, start_line: int, end_line: int = None) -> str:
-        """Generate GitHub URL with line number references."""
-        if end_line and end_line != start_line:
-            return f"{url}#L{start_line}-L{end_line}"
-        return f"{url}#L{start_line}"
-
-    @staticmethod
-    def format_line_numbers(content: str, start_line: Optional[int] = None, end_line: Optional[int] = None, max_length: Optional[int] = None) -> str:
+    def get_color_from_extension(self, filename: str) -> discord.Color:
         """
-        Format content with line numbers.
-        If start_line and end_line are provided, only show that range.
-        Otherwise, show all lines with numbers.
-        If max_length is provided, truncate while preserving the requested line range.
+        Generate a consistent color based on file extension
+        Replaces 'colorhash' dependency to keep the cog lightweight
         """
-        lines = content.splitlines()
-
-        # If no line range specified, show all lines
-        if start_line is None:
-            start_line = 1
-            end_line = len(lines)
-        elif end_line is None:
-            end_line = start_line
-
-        # Validate line numbers
-        start_line = max(1, start_line)
-        end_line = min(len(lines), end_line)
-        if start_line > end_line:
-            start_line, end_line = end_line, start_line
-
-        # Calculate padding for line numbers
-        padding = len(str(end_line))
-
-        # If we have a max length and specific lines requested, prioritize those lines
-        if max_length is not None and start_line is not None:
-            # Get the specified range first
-            selected_lines = lines[start_line - 1:end_line]
-
-            # Add context before and after if space permits
-            remaining_lines = max_length - sum(len(line) for line in selected_lines)
-            context_lines = 3  # Number of context lines to show before and after
-
-            if remaining_lines > 0:
-                # Add lines before
-                before_start = max(0, start_line - 1 - context_lines)
-                before_lines = lines[before_start:start_line - 1]
-
-                # Add lines after
-                after_end = min(len(lines), end_line + context_lines)
-                after_lines = lines[end_line:after_end]
-
-                selected_lines = before_lines + selected_lines + after_lines
-                start_line = before_start + 1
-
-            # Create the numbered lines
-            numbered_lines = []
-            current_line = start_line
-            output = ""
-
-            for line in selected_lines:
-                numbered_line = f"{current_line:{padding}d} │ {line}\n"
-                if len(output) + len(numbered_line) > max_length:
-                    break
-                output += numbered_line
-                numbered_lines.append(numbered_line.rstrip())
-                current_line += 1
-
-            return "\n".join(numbered_lines)
-        else:
-            # Get all specified lines
-            selected_lines = lines[start_line - 1:end_line]
-
-            # Add line numbers
-            numbered_lines = [
-                f"{i:{padding}d} │ {line}"
-                for i, line in enumerate(selected_lines, start=start_line)
-            ]
-
-            result = "\n".join(numbered_lines)
-
-            # Truncate if needed
-            if max_length and len(result) > max_length:
-                return result[:max_length - 4] + "...\n"
-
-            return result
-
-    @commands.group()
-    @checks.admin()
-    async def github(self, ctx: commands.Context):
-        """Configure GitHub integration settings"""
-        pass
-
-    @github.command()
-    async def setup(self, ctx: commands.Context):
-        """Set up GitHub integration for this server"""
-        view = SetupButton(member=ctx.author)
-        await ctx.send("To set up GitHub integration, press this button.", view=view)
-        await view.wait()
-
-        if view.modal is None:
-            return
-
-        # Store in config securely
-        async with self.config.guild(ctx.guild).servers() as servers:
-            servers["default"] = {
-                "token": view.modal.token.value,
-                "repository": view.modal.repository.value
-            }
-
-        # Initialize GitHub instance
         try:
-            auth = Auth.Token(view.modal.token.value)
-            gh = Github(auth=auth)
-            repo = gh.get_repo(view.modal.repository.value)
-            self.gh_instances[ctx.guild.id] = {
-                "client": gh,
-                "repo": repo
-            }
-            await ctx.send("✅ GitHub integration configured successfully!", ephemeral=True)
+            ext = filename.split(".")[-1]
+        except IndexError:
+            ext = filename
+            
+        # Use MD5 of extension to get a consistent hash
+        hash_object = hashlib.md5(ext.encode())
+        hex_dig = hash_object.hexdigest()
+        # Take first 6 chars for RGB
+        return discord.Color(int(hex_dig[:6], 16))
+
+    async def get_github_object(
+        self, 
+        url: str, 
+        *, 
+        params: Optional[Dict[str, str]] = None, 
+        accept: Optional[str] = None
+    ) -> Any:
+        """Fetch object from GitHub API with caching"""
+        if not self.session:
+            raise RuntimeError("GitHub session not initialized.")
+        
+        log.debug(f"Fetching GitHub object at URL {url}...")
+        
+        paramstr = str(params)
+        cache_key = (url, paramstr, accept)
+        
+        # Check cache
+        if cache_key in self.cache:
+            contents, date = self.cache[cache_key]
+            headers = {"If-Modified-Since": date}
+            if accept:
+                headers["Accept"] = accept
+            
+            async with self.session.get(url, headers=headers, params=params) as response:
+                if response.status == 304:
+                    return contents
+                if response.status == 200:
+                    # Update cache if 200
+                    contents = await response.json()
+                    if "Last-Modified" in response.headers:
+                        self.cache[cache_key] = (contents, response.headers["Last-Modified"])
+                    return contents
+        
+        headers = {}
+        if accept:
+            headers["Accept"] = accept
+            
+        async with self.session.get(url, params=params, headers=headers) as response:
+            if response.status != 200:
+                txt = await response.text()
+                raise Exception(f"GitHub API returned {response.status}: {txt}")
+
+            contents = await response.json()
+            if "Last-Modified" in response.headers:
+                self.cache[cache_key] = (contents, response.headers["Last-Modified"])
+
+            return contents
+
+    def format_desc(self, desc: str) -> str:
+        """Format description by removing comments and truncating"""
+        res = MD_COMMENT_RE.sub("", desc)
+        if len(res) > MAX_BODY_LENGTH:
+            res = res[:MAX_BODY_LENGTH] + "..."
+        return res
+
+    def is_repo_valid_for_command(
+        self, 
+        repo_config: Dict[str, Any], 
+        channel: discord.TextChannel, 
+        prefix: Optional[str]
+    ) -> bool:
+        """Check if a repo config is valid for the given channel and prefix"""
+        repo_prefix = repo_config.get("prefix")
+        repo_prefix_required = repo_config.get("prefix_required", True)
+        repo_prefix_whitelist = repo_config.get("prefix_whitelist", [])
+
+        if str(channel.id) in repo_prefix_whitelist:
+            repo_prefix_required = False
+
+        if prefix is not None and repo_prefix != prefix:
+            return False
+
+        if prefix is None and repo_prefix_required:
+            return False
+
+        return True
+
+    async def post_embedded_issue_or_pr(
+        self, 
+        channel: discord.TextChannel, 
+        repo: str, 
+        issueid: int, 
+        sender_data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Post an embedded issue or PR"""
+        url = self.github_url(f"/repos/{repo}/issues/{issueid}")
+        try:
+            content = await self.get_github_object(url)
         except Exception as e:
-            await ctx.send(f"❌ Error configuring GitHub: {str(e)}", ephemeral=True)
-
-    @github.command()
-    async def channel(self, ctx: commands.Context, enabled: bool = True):
-        """Enable/disable GitHub lookups in the current channel"""
-        async with self.config.guild(ctx.guild).enabled_channels() as channels:
-            if enabled and ctx.channel.id not in channels:
-                channels.append(ctx.channel.id)
-            elif not enabled and ctx.channel.id in channels:
-                channels.remove(ctx.channel.id)
-
-        status = "enabled" if enabled else "disabled"
-        await ctx.send(f"GitHub lookups {status} for this channel")
-
-    @github.command()
-    async def status(self, ctx: commands.Context):
-        """Show the current GitHub integration status"""
-        servers = await self.config.guild(ctx.guild).servers()
-        enabled_channels = await self.config.guild(ctx.guild).enabled_channels()
-
-        if not servers:
-            await ctx.send("❌ GitHub integration is not configured for this server.")
+            log.error(f"Failed to fetch issue {issueid}: {e}")
+            await channel.send(f"⚠️ Error fetching `#{issueid}` from `{repo}`: {e}")
             return
 
-        embed = discord.Embed(
-            title="GitHub Integration Status",
-            color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+        # Check if it's a PR
+        is_pr = content.get("pull_request") is not None
+        prcontent = {}
+        
+        if is_pr:
+            try:
+                pr_url = self.github_url(f"/repos/{repo}/pulls/{issueid}")
+                prcontent = await self.get_github_object(pr_url)
+            except Exception as e:
+                log.error(f"Failed to fetch PR details for {issueid}: {e}")
+                # Fallback to issue content if PR fetch fails
+                is_pr = False
+
+        # Create embed
+        embed = discord.Embed()
+        emoji = ""
+        
+        # LOGIC FIX HERE
+        if content["state"] == "open":
+            # Open is always Green (whether Issue or PR)
+            emoji = "<:open:1446291254911701164>" 
+            embed.color = COLOR_GITHUB_GREEN
+        elif is_pr and prcontent.get("merged"):
+            # Merged PR is Purple
+            emoji = "<:merge:1446291518661984357>"
+            embed.color = COLOR_GITHUB_PURPLE
+        else:
+            # Closed (Issue or unmerged PR) is Red
+            emoji = "<:closed:1446291305025241200>"
+            embed.color = COLOR_GITHUB_RED
+
+        embed.title = f"{emoji} {content['title']}"
+        embed.url = content["html_url"]
+        embed.set_footer(
+            text=f"{repo}#{content['number']} by {content['user']['login']}", 
+            icon_url=content["user"]["avatar_url"]
         )
 
-        # Show repository info
-        repo_info = servers.get("default", {})
-        if repo_info:
-            embed.add_field(
-                name="Repository",
-                value=f"`{repo_info['repository']}`",
-                inline=False
+        if sender_data:
+            embed.set_author(
+                name=sender_data["login"], 
+                url=sender_data["html_url"], 
+                icon_url=sender_data["avatar_url"]
             )
 
-        # Show enabled channels
-        if enabled_channels:
-            channel_mentions = [f"<#{channel_id}>" for channel_id in enabled_channels]
-            embed.add_field(
-                name="Enabled Channels",
-                value="\n".join(channel_mentions) or "None",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="Enabled Channels",
-                value="No channels enabled",
-                inline=False
-            )
+        # Format description
+        body = self.format_desc(content["body"] or "")
+        embed.description = body + "\n"
 
-        # Test connection
-        if ctx.guild.id in self.gh_instances:
-            embed.add_field(
-                name="Connection Status",
-                value="✅ Connected",
-                inline=False
+        # Get reactions
+        try:
+            reactions = await self.get_github_object(
+                f"{url}/reactions?per_page=100", 
+                accept="application/vnd.github.squirrel-girl-preview+json"
             )
-        else:
-            embed.add_field(
-                name="Connection Status",
-                value="❌ Not connected",
-                inline=False
-            )
+            all_reactions = defaultdict(int)
+            for react in reactions:
+                all_reactions[react["content"]] += 1
 
+            reaction_text = ""
+            if all_reactions.get("+1"):
+                reaction_text += f"👍 {all_reactions['+1']}"
+            if all_reactions.get("-1"):
+                if reaction_text:
+                    reaction_text += "   "
+                reaction_text += f"👎 {all_reactions['-1']}"
+            
+            if reaction_text:
+                embed.description += reaction_text + "\n"
+        except Exception as e:
+            log.warning(f"Failed to fetch reactions: {e}")
+
+        # PR-specific info
+        if is_pr:
+            try:
+                merge_sha = prcontent["head"]["sha"]
+                check_content = await self.get_github_object(
+                    self.github_url(f"/repos/{repo}/commits/{merge_sha}/check-runs"),
+                    accept="application/vnd.github.antiope-preview+json"
+                )
+
+                checks = ""
+                for check in check_content["check_runs"]:
+                    status = "❓"
+                    if check["status"] == "queued":
+                        status = "😴"
+                    elif check["status"] == "in_progress":
+                        status = "🏃"
+                    elif check["status"] == "completed":
+                        conclusion = check.get("conclusion", "unknown")
+                        status_map = {
+                            "neutral": "😐",
+                            "success": "😄",
+                            "failure": "😭",
+                            "cancelled": "🛑",
+                            "timed_out": "⌛",
+                            "action_required": "🚧"
+                        }
+                        status = status_map.get(conclusion, "❓")
+
+                    checks += f"`{check['name']} {status}`\n"
+
+                if checks:
+                    embed.add_field(name="Checks", value=checks)
+
+                if not prcontent.get("mergeable", True) and content["state"] == "open":
+                    embed.add_field(name="Status", value="🚨 CONFLICTS 🚨")
+            except Exception as e:
+                log.warning(f"Failed to fetch PR checks: {e}")
+
+        await channel.send(embed=embed)
+
+    @red_commands.group()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def ghset(self, ctx: red_commands.Context):
+        """Configure GitHub integration"""
+        pass
+
+    @ghset.command(name="token")
+    async def set_token(self, ctx: red_commands.Context, potential_token: Optional[str] = None):
+        """
+        Set the GitHub API token via DM.
+        
+        Run this command without arguments to start the DM process.
+        """
+        # Security: If they accidentally provided the token in the command, delete it
+        if potential_token and ctx.guild:
+            try:
+                await ctx.message.delete()
+            except (discord.Forbidden, discord.NotFound):
+                pass
+            await ctx.send(f"{ctx.author.mention} ⚠️ Please do not provide the token directly in the channel! I've initiated a DM session for you.", delete_after=10)
+        
+        # Determine where to interact
+        if ctx.guild:
+            await ctx.send(f"{ctx.author.mention}, check your DMs to set the GitHub token.")
+            
+        try:
+            dm_channel = await ctx.author.create_dm()
+        except discord.Forbidden:
+            if ctx.guild:
+                await ctx.send("❌ I couldn't send you a DM. Please enable DMs from server members.")
+            return
+
+        # Prompt in DM
+        msg_content = (
+            "Please paste your GitHub Personal Access Token below.\n"
+            "**Requirements:**\n"
+            "- It often starts with `ghp_` or `github_pat_`.\n"
+            "- This request will time out in 60 seconds.\n\n"
+            "You can generate a token here: <https://github.com/settings/tokens>\n"
+            "Type `cancel` to stop."
+        )
+        try:
+            await dm_channel.send(msg_content)
+        except discord.Forbidden:
+            return
+
+        # Wait function
+        def check(m):
+            return m.author == ctx.author and m.channel == dm_channel
+
+        try:
+            msg = await self.bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await dm_channel.send("❌ Operation timed out. Please try `.ghset token` again.")
+            return
+
+        response = msg.content.strip()
+        
+        if response.lower() == "cancel":
+            await dm_channel.send("Operation cancelled.")
+            return
+
+        # Set the token
+        await self.config.token.set(response)
+        
+        # Reinitialize session
+        if self.session:
+            await self.session.close()
+        
+        self._init_session(response)
+        
+        await dm_channel.send("✅ GitHub token set successfully!")
+
+    @ghset.command(name="addrepo")
+    async def add_repo(
+        self, 
+        ctx: red_commands.Context, 
+        repo: str, 
+        prefix: str, 
+        prefix_required: bool = True
+    ):
+        """Add a repository configuration
+        
+        Example: [p]ghset addrepo owner/repo gh true
+        """
+        repo = self._parse_repo_path(repo)
+        
+        if not repo or "/" not in repo:
+            await ctx.send("❌ Invalid repository format. Use `owner/repo`.")
+            return
+        
+        # Verify the repo exists
+        try:
+            url = self.github_url(f"/repos/{repo}")
+            await self.get_github_object(url)
+        except Exception as e:
+            await ctx.send(f"❌ Could not access repository `{repo}`. Make sure it exists and the token has access.\nError: {str(e)}")
+            return
+        
+        async with self.config.guild(ctx.guild).repos() as repos:
+            if any(r["repo"] == repo for r in repos):
+                await ctx.send(f"⚠️ Repository `{repo}` is already configured!")
+                return
+            
+            repo_config = {
+                "repo": repo,
+                "prefix": prefix,
+                "prefix_required": prefix_required,
+                "branch": "master", # Default branch
+                "prefix_whitelist": []
+            }
+            repos.append(repo_config)
+        
+        await ctx.send(f"✅ Added repo `{repo}` with prefix `{prefix}`")
+
+    @ghset.command(name="setbranch")
+    async def set_branch(self, ctx: red_commands.Context, repo_name: str, branch: str):
+        """Set the default branch for file lookups"""
+        repo_name = self._parse_repo_path(repo_name)
+        
+        async with self.config.guild(ctx.guild).repos() as repos:
+            for r in repos:
+                if r["repo"] == repo_name:
+                    r["branch"] = branch
+                    await ctx.send(f"✅ Branch for `{repo_name}` set to `{branch}`.")
+                    return
+        
+        await ctx.send(f"❌ Repo `{repo_name}` not configured.")
+    
+    def _parse_repo_path(self, repo: str) -> str:
+        """Parse a repo path from various formats"""
+        if repo.startswith("https://github.com/"):
+            repo = repo.replace("https://github.com/", "")
+        elif repo.startswith("github.com/"):
+            repo = repo.replace("github.com/", "")
+        
+        repo = repo.rstrip("/")
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        
+        return repo
+
+    @ghset.command(name="removerepo")
+    async def remove_repo(self, ctx: red_commands.Context, repo: str):
+        """Remove a repository configuration"""
+        repo = self._parse_repo_path(repo)
+        
+        async with self.config.guild(ctx.guild).repos() as repos:
+            original_count = len(repos)
+            repos[:] = [r for r in repos if r["repo"] != repo]
+            
+            if len(repos) == original_count:
+                await ctx.send(f"❌ Repository `{repo}` not found in configuration.")
+                return
+        
+        await ctx.send(f"✅ Removed repo `{repo}`")
+
+    @ghset.command(name="listrepos")
+    async def list_repos(self, ctx: red_commands.Context):
+        """List configured repositories"""
+        repos = await self.config.guild(ctx.guild).repos()
+        
+        if not repos:
+            await ctx.send("No repositories configured for this server.")
+            return
+        
+        embed = discord.Embed(title="Configured Repositories", color=discord.Color.blue())
+        for repo in repos:
+            value = f"Prefix: `{repo['prefix']}`\n"
+            value += f"Prefix Required: {repo['prefix_required']}\n"
+            value += f"Branch: {repo.get('branch', 'master')}"
+            embed.add_field(name=repo['repo'], value=value, inline=False)
+        
         await ctx.send(embed=embed)
 
-    async def find_matching_files(self, repo, filename: str) -> List[Tuple[str, ContentFile]]:
-        """Find all files matching the given filename in the repository"""
-        async with self.search_lock:  # Prevent multiple simultaneous searches
-            matches = []
-            loop = asyncio.get_running_loop()
-
-            try:
-                # First try direct path
-                content = await loop.run_in_executor(
-                    None,
-                    lambda: repo.get_contents(filename)
-                )
-                if not isinstance(content, list):
-                    matches.append((filename, content))
-                    return matches
-            except GithubException:
-                pass
-
-            if '/' in filename:  # If path is specified, don't do full search
-                return matches
-
-            # Use recursive tree search
-            try:
-                tree = await loop.run_in_executor(
-                    None,
-                    lambda: repo.get_git_tree(repo.default_branch, recursive=True)
-                )
-
-                for item in tree.tree:
-                    if item.type == 'blob' and item.path.endswith(filename):
-                        try:
-                            content = await loop.run_in_executor(
-                                None,
-                                lambda: repo.get_contents(item.path)
-                            )
-                            matches.append((item.path, content))
-                        except GithubException:
-                            continue
-
-            except GithubException as e:
-                print(f"Search error: {e}")
-
-            return matches
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+    @red_commands.command()
+    async def giveissue(self, ctx: red_commands.Context, prefix: Optional[str] = None):
+        """Get a random issue from a configured repository"""
+        repos = await self.config.guild(ctx.guild).repos()
+        
+        if not repos:
+            await ctx.send("❌ No repositories configured.")
             return
 
-        enabled_channels = await self.config.guild(message.guild).enabled_channels()
-        if message.channel.id not in enabled_channels:
-            return
+        await ctx.message.add_reaction("⏳")
 
-        gh_data = self.gh_instances.get(message.guild.id)
-        if not gh_data:
-            return
+        for repo_config in repos:
+            repo = repo_config["repo"]
 
-        repo = gh_data["repo"]
-
-        # Look for file references [filename.cs] or [filename.cs:123] or [filename.cs:123-128]
-        file_matches = re.findall(r'\[(.*?)]', message.content)
-        for filename in file_matches:
-            if filename.startswith('#'):  # Skip PR/issue references
+            if prefix and repo_config.get("prefix") != prefix:
+                continue
+            
+            if not prefix and repo_config.get("prefix_required", True):
                 continue
 
             try:
-                async with message.channel.typing():
-                    # Extract line numbers if present
-                    file_path, start_line, end_line = self.extract_line_numbers(filename)
-                    matches = await self.find_matching_files(repo, file_path)
+                url = self.github_url(f"/repos/{repo}/issues")
+                params = {"state": "open", "per_page": 30}
+                
+                # Check header for pagination
+                async with self.session.get(url, params=params) as page_get:
+                    if page_get.status != 200:
+                        continue
+                    
+                    link_header = page_get.headers.get("Link", "")
+                    
+                    if not link_header:
+                        issue_page = await page_get.json()
+                        if not issue_page: continue
+                        rand_issue = random.choice(issue_page)["number"]
+                        await self.post_embedded_issue_or_pr(ctx.channel, repo, rand_issue)
+                        await ctx.message.remove_reaction("⏳", ctx.me)
+                        await ctx.message.add_reaction("👍")
+                        return
+                    
+                    lastpagematch = REG_GIT_HEADER_PAGENUM.search(link_header)
+                    if lastpagematch:
+                        maxpage = int(lastpagematch.group(1))
+                        pagenum = random.randrange(1, maxpage + 1)
+                        issue_page = await self.get_github_object(url, params={"page": str(pagenum), "state": "open", "per_page": 30})
+                    else:
+                        issue_page = await page_get.json()
+                    
+                    if not issue_page: continue
 
-                if not matches:
-                    embed = discord.Embed(
-                        title="❌ File Not Found",
-                        description=f"Could not find file '{file_path}' in the repository.",
-                        color=discord.Color.red()
-                    )
-                    await message.channel.send(embed=embed)
-                    continue
+                    rand_issue = random.choice(issue_page)["number"]
+                    await self.post_embedded_issue_or_pr(ctx.channel, repo, rand_issue)
+                    
+                    await ctx.message.remove_reaction("⏳", ctx.me)
+                    await ctx.message.add_reaction("👍")
+                    return
 
-                if len(matches) > 1 and not '/' in file_path:
-                    # Multiple matches found, show paths with GitHub links
-                    embed = discord.Embed(
-                        title="Multiple Files Found",
-                        description="Please specify the full path to one of these files:",
-                        color=discord.Color.gold()
-                    )
+            except Exception:
+                continue
 
-                    if len(matches) > 10:
-                        embed.description += f"\n\nShowing 10 of {len(matches)} matches"
+        await ctx.message.remove_reaction("⏳", ctx.me)
+        await ctx.send("❌ No random issue found.")
 
-                    for path, content in matches[:10]:
-                        embed.add_field(
-                            name=path,
-                            value=f"[View on GitHub]({content.html_url})",
-                            inline=False
-                        )
+    async def handle_file_lookup(self, message: discord.Message, repos: List[Dict[str, Any]]) -> bool:
+        """Handle file path lookups [path/to/file.py]"""
+        if not REG_PATH.search(message.content):
+            return False
 
-                    await message.channel.send(embed=embed)
-                    continue
+        # Parse all matches first
+        prefixes = [None]
+        paths = []
+        
+        for match in REG_PATH.finditer(message.content):
+            prefix = match.group(1)
+            if prefix is not None and prefix not in prefixes:
+                prefixes.append(prefix)
+            
+            path_str = match.group(2).lower()
+            if len(path_str) <= 3: # Ignore short paths
+                continue
+                
+            rooted = False
+            if path_str.startswith("^"):
+                path_str = path_str[1:]
+                rooted = True
+                
+            linestart = match.group(3)
+            lineend = match.group(4)
+            
+            paths.append((path_str, linestart, lineend, rooted, prefix))
 
-                # Get the matching file
-                if '/' in file_path:
-                    match = next((m for m in matches if m[0] == file_path), None)
-                else:
-                    # If no path specified and only one match, use it
-                    match = matches[0] if len(matches) == 1 else None
+        if not paths:
+            return False
 
-                if not match:
-                    embed = discord.Embed(
-                        title="❌ File Not Found",
-                        description=f"Could not find exact file '{file_path}' in the repository.",
-                        color=discord.Color.red()
-                    )
-                    await message.channel.send(embed=embed)
-                    continue
+        # Output structure: repo_name -> list of (title, url)
+        output = defaultdict(list)
+        color = None
 
-                path, content = match
-                file_content = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: content.decoded_content.decode()
-                )
+        for repo_config in repos:
+            # Check if this repo matches any of the prefixes found
+            if not any(self.is_repo_valid_for_command(repo_config, message.channel, p) for p in prefixes):
+                continue
 
-                max_content_length = 1900  # Leave room for Discord's formatting
+            repo = repo_config["repo"]
+            branchname = repo_config.get("branch", "master")
 
-                if start_line is not None:
-                    # If specific lines requested, prioritize those
-                    file_content = self.format_line_numbers(
-                        file_content,
-                        start_line,
-                        end_line,
-                        max_length=max_content_length
-                    )
-                    line_range = f" (lines {start_line}-{end_line})" if end_line and end_line != start_line else f" (line {start_line})"
-                    github_url = self.get_line_range_url(content.html_url, start_line, end_line)
-                else:
-                    # Otherwise show beginning of file with line numbers
-                    file_content = self.format_line_numbers(
-                        file_content,
-                        max_length=max_content_length
-                    )
-                    line_range = ""
-                    github_url = content.html_url
-
-                # Check if content was truncated
-                original_lines_count = len(content.decoded_content.decode().splitlines())
-                shown_lines_count = len(file_content.splitlines())
-                if shown_lines_count < original_lines_count:
-                    file_content += f"\n... (showing {shown_lines_count} of {original_lines_count} lines)"
-
-                embed = discord.Embed(
-                    title=f"📄 {path}{line_range}",
-                    description=box(file_content, lang=path.split('.')[-1]),
-                    color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
-                )
-                embed.add_field(
-                    name="View on GitHub",
-                    value=f"[View file]({github_url})",
-                    inline=False
-                )
-                await message.channel.send(embed=embed)
-
-            except Exception as e:
-                embed = discord.Embed(
-                    title="❌ Error",
-                    description=f"An error occurred: {str(e)}",
-                    color=discord.Color.red()
-                )
-                await message.channel.send(embed=embed)
-
-        pr_matches = re.findall(r'\[#(\d+)]', message.content)
-        for ref_number in pr_matches:
             try:
-                # Try to get PR first
-                try:
-                    pr = repo.get_pull(int(ref_number))
-                    is_pr = True
-                except GithubException:
-                    # If PR not found, try to get issue
-                    issue = repo.get_issue(int(ref_number))
-                    is_pr = False
+                # Get Branch SHA
+                url = self.github_url(f"/repos/{repo}/branches/{branchname}")
+                branch_data = await self.get_github_object(url)
+                branch_sha = branch_data['commit']['sha']
 
-                if is_pr:
-                    # Handle Pull Request
-                    cleaned_body = self.strip_html_comments(pr.body)
-                    status, color = self.get_pr_status(pr)
+                # Get Tree (Recursive)
+                tree_url = self.github_url(f"/repos/{repo}/git/trees/{branch_sha}")
+                tree_data = await self.get_github_object(tree_url, params={"recursive": "1"})
+                
+                if "tree" not in tree_data:
+                    continue
 
-                    embed = discord.Embed(
-                        title=f"PR #{pr.number} {pr.title}",
-                        description=cleaned_body[:1000] if pr.body else "No description provided",
-                        color=color,
-                        url=pr.html_url,
-                        timestamp=pr.created_at
-                    )
+                for search_path, linestart, lineend, rooted, match_prefix in paths:
+                    if not self.is_repo_valid_for_command(repo_config, message.channel, match_prefix):
+                        continue
 
-                    if cleaned_body and len(cleaned_body) > 1000:
-                        embed.description += "\n\n... (description truncated)"
-
-                    embed.add_field(name="Status", value=status, inline=True)
-                    embed.add_field(name="Author", value=pr.user.login, inline=True)
-                    embed.add_field(name="Comments", value=str(pr.comments), inline=True)
-
-                    if pr.merged:
-                        embed.add_field(name="Merged by", value=pr.merged_by.login, inline=True)
-                        embed.add_field(name="Merged at", value=pr.merged_at.strftime("%Y-%m-%d %H:%M UTC"),
-                                        inline=True)
-
-                else:
-                    # Handle Issue
-                    cleaned_body = self.strip_html_comments(issue.body)
-                    color = self.get_issue_status_color(issue)
-
-                    embed = discord.Embed(
-                        title=f"Issue #{issue.number} {issue.title}",
-                        description=cleaned_body[:1000] if issue.body else "No description provided",
-                        color=color,
-                        url=issue.html_url,
-                        timestamp=issue.created_at
-                    )
-
-                    if cleaned_body and len(cleaned_body) > 1000:
-                        embed.description += "\n\n... (description truncated)"
-
-                    embed.add_field(name="Status", value=issue.state.capitalize(), inline=True)
-                    embed.add_field(name="Author", value=issue.user.login, inline=True)
-                    embed.add_field(name="Comments", value=str(issue.comments), inline=True)
-
-                    if issue.labels:
-                        labels = ", ".join(label.name for label in issue.labels)
-                        embed.add_field(name="Labels", value=labels, inline=True)
-
-                    if issue.assignees:
-                        assignees = ", ".join(assignee.login for assignee in issue.assignees)
-                        embed.add_field(name="Assignees", value=assignees, inline=True)
-
-                await message.channel.send(embed=embed)
-
+                    # Search tree
+                    for file_node in tree_data["tree"]:
+                        node_path = file_node["path"]
+                        node_path_lower = node_path.lower()
+                        
+                        match = False
+                        if rooted:
+                            if node_path_lower.startswith(search_path):
+                                match = True
+                        else:
+                            if node_path_lower.endswith(search_path):
+                                match = True
+                                
+                        if match:
+                            # Construct URL
+                            file_url_part = quote(node_path)
+                            if linestart:
+                                file_url_part += f"#L{linestart}"
+                                if lineend:
+                                    file_url_part += f"-L{lineend}"
+                            
+                            full_url = f"https://github.com/{repo}/blob/{branchname}/{file_url_part}"
+                            
+                            title = node_path
+                            if lineend:
+                                title += f" lines {linestart}-{lineend}"
+                            elif linestart:
+                                title += f" line {linestart}"
+                                
+                            output[repo].append((title, full_url))
+                            
+                            # Determine color based on extension of the found file
+                            this_color = self.get_color_from_extension(node_path)
+                            if color is None:
+                                color = this_color
+                            elif color != this_color:
+                                color = discord.Color.default() # Mixed types
             except Exception as e:
-                embed = discord.Embed(
-                    title="❌ Error",
-                    description=f"Error accessing #{ref_number}: {str(e)}",
-                    color=discord.Color.red()
-                )
+                log.debug(f"Error fetching tree for {repo}: {e}")
+                continue
+
+        if not output:
+            return False
+
+        embed = discord.Embed()
+        if color:
+            embed.color = color
+
+        for repo, hits in output.items():
+            value = ""
+            count = 0
+            # Limit hits per repo to avoid hitting embed limits
+            for title, url in hits:
+                count += 1
+                entry = f"[`{title}`]({url})\n"
+                if len(value) + len(entry) > 1000:
+                    value += f"...and {len(hits) - count + 1} more."
+                    break
+                value += entry
+            
+            embed.add_field(name=repo, value=value, inline=False)
+
+        await message.channel.send(embed=embed)
+        return True
+
+    @red_commands.Cog.listener()
+    async def on_message_without_command(self, message: discord.Message):
+        """Listen for issue/PR references and file paths in messages"""
+        if message.author.bot or not message.guild:
+            return
+
+        if not await self.bot.allowed_by_whitelist_blacklist(message.author):
+            return
+
+        repos = await self.config.guild(message.guild).repos()
+        if not repos:
+            return
+
+        # 1. Try File Lookup
+        if await self.handle_file_lookup(message, repos):
+            return
+
+        messages_sent = 0
+
+        # 2. Handle Issue References
+        for repo_config in repos:
+            repo = repo_config["repo"]
+
+            # Issues
+            for match in REG_ISSUE.finditer(message.content):
+                prefix = match.group(1)
+                
+                if not self.is_repo_valid_for_command(repo_config, message.channel, prefix):
+                    continue
+
+                issueid = int(match.group(2))
+                
+                if not prefix and issueid < 30:
+                    continue
+
+                await self.post_embedded_issue_or_pr(message.channel, repo, issueid)
+                
+                messages_sent += 1
+                if messages_sent >= GITHUB_ISSUE_MAX_MESSAGES:
+                    return
+
+            # Commits
+            for match in REG_COMMIT.finditer(message.content):
+                prefix = match.group(1)
+
+                if not self.is_repo_valid_for_command(repo_config, message.channel, prefix):
+                    continue
+
+                sha = match.group(2)
+                url = self.github_url(f"/repos/{repo}/git/commits/{sha}")
+                
+                try:
+                    commit = await self.get_github_object(url)
+                except Exception:
+                    continue
+
+                split = commit["message"].split("\n")
+                title = split[0]
+                desc = "\n".join(split[1:])
+                
+                if len(desc) > MAX_BODY_LENGTH:
+                    desc = desc[:MAX_BODY_LENGTH] + "..."
+
+                embed = discord.Embed()
+                embed.set_footer(text=f"{repo} {sha} by {commit['author']['name']}")
+                embed.url = commit["html_url"]
+                embed.title = title
+                embed.description = self.format_desc(desc)
+
                 await message.channel.send(embed=embed)
+
+                messages_sent += 1
+                if messages_sent >= GITHUB_ISSUE_MAX_MESSAGES:
+                    return
+
+async def setup(bot: Red):
+    """Setup function for Red-Discord bot"""
+    cog = GitHub(bot)
+    await bot.add_cog(cog)
